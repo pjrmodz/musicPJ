@@ -3,176 +3,68 @@ import express from "express";
 import cors from "cors";
 import { spawn } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
+import { Readable } from "node:stream";
 import fs from "node:fs";
-import fsp from "node:fs/promises";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
 
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const APP_PASSWORD = process.env.APP_PASSWORD || "";
 const YTDLP = process.env.YTDLP_PATH || "yt-dlp";
-const YTDLP_EXTRA = (process.env.YTDLP_EXTRA_ARGS ?? "--js-runtimes node --remote-components ejs:github").split(" ").filter(Boolean);
-const CACHE_DIR = process.env.CACHE_DIR || "/tmp/waves-cache";
-const CACHE_MAX_BYTES = Number(process.env.CACHE_MAX_MB || 400) * 1024 * 1024;
-const CACHE_MAX_AGE_MS = Number(process.env.CACHE_MAX_AGE_MIN || 180) * 60_000;
-const MAX_PARALLEL = Number(process.env.MAX_PARALLEL || 2);
-const DL_TIMEOUT_MS = 180_000;
+const YTDLP_EXTRA = (
+  process.env.YTDLP_EXTRA_ARGS ??
+  "--js-runtimes node --remote-components ejs:github"
+).split(" ").filter(Boolean);
+
 const ID_RE = /^[\w-]{11}$/;
-
-fs.mkdirSync(CACHE_DIR, { recursive: true });
-
-// ---------- cookies ----------
-let resolvedCookiesFile = process.env.COOKIES_FILE || "";
+let cookiesFile = process.env.COOKIES_FILE || "";
 
 if (process.env.COOKIES_B64) {
   try {
-    const decoded = Buffer.from(process.env.COOKIES_B64, "base64").toString("utf8");
-    const tmpPath = path.join(os.tmpdir(), "waves-cookies.txt");
-    fs.writeFileSync(tmpPath, decoded, { mode: 0o600 });
-    resolvedCookiesFile = tmpPath;
-    console.log("cookies carregados via COOKIES_B64 →", tmpPath);
+    cookiesFile = path.join(os.tmpdir(), "musicpj-cookies.txt");
+    fs.writeFileSync(
+      cookiesFile,
+      Buffer.from(process.env.COOKIES_B64, "base64"),
+      { mode: 0o600 }
+    );
+    console.log("Cookies carregados.");
   } catch (e) {
-    console.error("falha ao decodificar COOKIES_B64:", e.message);
+    console.error("Falha ao carregar cookies:", e.message);
   }
 }
 
-// ---------- servidor ----------
 const app = express();
 app.set("trust proxy", 1);
-
-// DIAGNÓSTICO: registrar requisições e respostas
-app.use((req, res, next) => {
-  console.log("REQUISIÇÃO RECEBIDA:", req.method, req.path);
-
-  res.on("finish", () => {
-    console.log("RESPOSTA ENVIADA:", req.method, req.path, res.statusCode);
-  });
-
-  next();
-});
 
 app.use(cors({
   origin: ALLOWED_ORIGIN,
   exposedHeaders: [
-    "Content-Disposition",
     "Content-Length",
     "Accept-Ranges",
-    "Content-Range"
+    "Content-Range",
+    "Content-Disposition"
   ]
 }));
 
-// ---------- utilitários ----------
-const fmtDur = (s) => {
-  s = Math.round(Number(s) || 0);
-  if (!s) return "";
-
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s % 60;
-
-  return h
-    ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`
-    : `${m}:${String(r).padStart(2, "0")}`;
-};
-
-const safeName = (s = "audio") =>
-  String(s).replace(/[\\/:*?"<>|\x00-\x1f]/g, "").trim().slice(0, 120) || "audio";
-
-const baseArgs = () => [
-  ...YTDLP_EXTRA,
-  ...(resolvedCookiesFile && fs.existsSync(resolvedCookiesFile)
-    ? ["--cookies", resolvedCookiesFile]
-    : []),
-  "--no-warnings"
-];
-
-// ---------- execução yt-dlp ----------
-function runYtdlp(args, timeoutMs = 60_000) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(YTDLP, [
-      ...baseArgs(),
-      "--verbose",
-      ...args
-    ]);
-
-    let out = "";
-    let err = "";
-
-    const t = setTimeout(() => {
-      p.kill("SIGKILL");
-      reject(new Error("timeout"));
-    }, timeoutMs);
-
-    p.stdout.on("data", (d) => {
-      out += d.toString();
-    });
-
-    p.stderr.on("data", (d) => {
-      err += d.toString();
-    });
-
-    p.on("error", (e) => {
-      clearTimeout(t);
-      reject(e);
-    });
-
-    p.on("close", (code) => {
-      clearTimeout(t);
-
-      if (code === 0) {
-        resolve(out);
-      } else {
-        const detalhes = err.trim().split("\n").slice(-25).join("\n");
-
-        console.error("yt-dlp diagnóstico:\n" + detalhes);
-
-        reject(new Error(
-          detalhes || `yt-dlp saiu com código ${code}`
-        ));
-      }
-    });
-  });
+function safeEq(a, b) {
+  const A = Buffer.from(String(a));
+  const B = Buffer.from(String(b));
+  return A.length === B.length && timingSafeEqual(A, B);
 }
 
-// ---------- limite de requisições ----------
-const hits = new Map();
-
-setInterval(() => hits.clear(), 60_000).unref();
-
-app.use((req, res, next) => {
-  if (req.method === "OPTIONS") return next();
-
-  const n = (hits.get(req.ip) || 0) + 1;
-  hits.set(req.ip, n);
-
-  if (n > 240) {
-    return res.status(429).json({ error: "muitas requisições" });
-  }
-
-  next();
-});
-
-// ---------- saúde ----------
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "waves-backend" });
+  res.json({ ok: true, name: "musicPJ" });
 });
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     auth: !!APP_PASSWORD,
-    cookies: !!resolvedCookiesFile && fs.existsSync(resolvedCookiesFile)
+    cookies: !!cookiesFile && fs.existsSync(cookiesFile),
+    conversion: false
   });
 });
-
-// ---------- autenticação ----------
-function safeEq(a, b) {
-  const A = Buffer.from(String(a));
-  const B = Buffer.from(String(b));
-
-  return A.length === B.length && timingSafeEqual(A, B);
-}
 
 app.use((req, res, next) => {
   if (req.method === "OPTIONS" || !APP_PASSWORD) return next();
@@ -181,10 +73,77 @@ app.use((req, res, next) => {
     return next();
   }
 
-  res.status(401).json({ error: "senha inválida" });
+  return res.status(401).json({ error: "senha inválida" });
 });
 
-// ---------- busca ----------
+function baseArgs() {
+  return [
+    ...YTDLP_EXTRA,
+    ...(cookiesFile && fs.existsSync(cookiesFile)
+      ? ["--cookies", cookiesFile]
+      : []),
+    "--no-warnings"
+  ];
+}
+
+function runYtdlp(args, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(YTDLP, [...baseArgs(), ...args]);
+
+    let stdout = "";
+    let stderr = "";
+
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("tempo esgotado ao consultar o YouTube"));
+    }, timeoutMs);
+
+    child.stdout.on("data", chunk => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", chunk => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    child.on("close", code => {
+      clearTimeout(timer);
+
+      if (code === 0) {
+        return resolve(stdout.trim());
+      }
+
+      const detail = stderr
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .slice(-3)
+        .join(" | ");
+
+      reject(new Error(
+        detail || `yt-dlp encerrou com código ${code}`
+      ));
+    });
+  });
+}
+
+function validId(req, res) {
+  const id = String(req.params.id ?? req.query.id ?? "");
+
+  if (!ID_RE.test(id)) {
+    res.status(400).json({ error: "id inválido" });
+    return null;
+  }
+
+  return id;
+}
+
+// Busca músicas
 const searchCache = new Map();
 
 app.get("/search", async (req, res) => {
@@ -195,29 +154,29 @@ app.get("/search", async (req, res) => {
   }
 
   const key = q.toLowerCase();
-  const hit = searchCache.get(key);
+  const cached = searchCache.get(key);
 
-  if (hit && Date.now() - hit.t < 10 * 60_000) {
-    return res.json({ results: hit.results });
+  if (cached && Date.now() - cached.time < 600000) {
+    return res.json({ results: cached.results });
   }
 
   try {
-    const out = await runYtdlp([
-      "--flat-playlist",
-      "-J",
-      `ytsearch15:${q}`
-    ]);
+    const raw = await runYtdlp(
+      ["--flat-playlist", "-J", `ytsearch15:${q}`],
+      90000
+    );
 
-    const data = JSON.parse(out);
+    const data = JSON.parse(raw);
 
     const results = (data.entries || [])
-      .filter((e) => e && ID_RE.test(e.id))
-      .map((e) => ({
-        id: e.id,
-        title: e.title,
-        artist: e.channel || e.uploader || "",
-        duration: fmtDur(e.duration),
-        thumbnail: `https://i.ytimg.com/vi/${e.id}/mqdefault.jpg`
+      .filter(item => item && ID_RE.test(item.id))
+      .map(item => ({
+        id: item.id,
+        title: item.title || "Sem título",
+        artist: item.channel || item.uploader || "",
+        duration: formatDuration(item.duration),
+        thumbnail:
+          `https://i.ytimg.com/vi/${item.id}/mqdefault.jpg`
       }));
 
     if (searchCache.size > 200) {
@@ -225,223 +184,238 @@ app.get("/search", async (req, res) => {
     }
 
     searchCache.set(key, {
-      t: Date.now(),
+      time: Date.now(),
       results
     });
 
-    res.json({ results });
+    return res.json({ results });
 
-  } catch (e) {
-    console.error("search:", e.message);
+  } catch (error) {
+    console.error("search:", error.message);
 
-    res.status(502).json({
+    return res.status(502).json({
       error: "falha na busca",
-      detail: e.message
+      detail: error.message
     });
   }
 });
 
-// ---------- fila de downloads ----------
-const inflight = new Map();
-let running = 0;
-const waiting = [];
+function formatDuration(value) {
+  const seconds = Math.round(Number(value) || 0);
 
-const acquire = () =>
-  new Promise((ok) => {
-    if (running < MAX_PARALLEL) {
-      running++;
-      ok();
-    } else {
-      waiting.push(ok);
-    }
-  });
+  if (!seconds) return "";
 
-const release = () => {
-  const next = waiting.shift();
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
 
-  if (next) {
-    next();
-  } else {
-    running--;
-  }
-};
-
-const fileFor = (id) =>
-  path.join(CACHE_DIR, `${id}.mp3`);
-
-function ensureMp3(id) {
-  const f = fileFor(id);
-
-  if (fs.existsSync(f) && fs.statSync(f).size > 1024) {
-    const now = new Date();
-    fs.utimes(f, now, now, () => {});
-    return Promise.resolve(f);
-  }
-
-  if (inflight.has(id)) {
-    return inflight.get(id);
-  }
-
-  const p = (async () => {
-    await acquire();
-
-    try {
-      await runYtdlp([
-        "-f", "bestaudio/best",
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "5",
-        "--no-playlist",
-        "--no-part",
-        "-o", path.join(CACHE_DIR, "%(id)s.%(ext)s"),
-        `https://www.youtube.com/watch?v=${id}`
-      ], DL_TIMEOUT_MS);
-
-      if (!fs.existsSync(f)) {
-        throw new Error("arquivo não gerado");
-      }
-
-      return f;
-
-    } finally {
-      release();
-    }
-  })().finally(() => {
-    inflight.delete(id);
-  });
-
-  inflight.set(id, p);
-
-  return p;
+  return h
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
 }
 
-// ---------- limpeza de cache ----------
-async function cleanCache() {
-  try {
-    const names = (await fsp.readdir(CACHE_DIR))
-      .filter((n) => n.endsWith(".mp3"));
+// Obtém o endereço do áudio original.
+// Não baixa nem converte para MP3.
+async function resolveAudioUrl(id) {
+  const output = await runYtdlp([
+    "--no-playlist",
+    "--format",
+    "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+    "--get-url",
+    `https://www.youtube.com/watch?v=${id}`
+  ], 90000);
 
-    const files = [];
+  const url = output
+    .split(/\r?\n/)
+    .find(line => /^https?:\/\//i.test(line));
 
-    for (const n of names) {
-      const p = path.join(CACHE_DIR, n);
-      const st = await fsp.stat(p).catch(() => null);
-
-      if (st) {
-        files.push({
-          p,
-          size: st.size,
-          t: st.mtimeMs
-        });
-      }
-    }
-
-    const now = Date.now();
-    let total = files.reduce((a, f) => a + f.size, 0);
-
-    files.sort((a, b) => a.t - b.t);
-
-    for (const f of files) {
-      if (
-        now - f.t > CACHE_MAX_AGE_MS ||
-        total > CACHE_MAX_BYTES
-      ) {
-        await fsp.unlink(f.p).catch(() => {});
-        total -= f.size;
-      }
-    }
-
-  } catch (e) {
-    console.error("limpeza de cache:", e.message);
+  if (!url) {
+    throw new Error(
+      "YouTube não retornou um endereço de áudio para este vídeo"
+    );
   }
+
+  return url;
 }
 
-setInterval(cleanCache, 10 * 60_000).unref();
-
-// ---------- validar ID ----------
-const validId = (req, res) => {
-  const id = String(req.params.id ?? req.query.id ?? "");
-
-  if (!ID_RE.test(id)) {
-    res.status(400).json({ error: "id inválido" });
-    return null;
-  }
-
-  return id;
-};
-
-// ---------- preparar áudio ----------
+// O player recebe o endereço do proxy local.
 app.get("/stream", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
 
   try {
-    await ensureMp3(id);
-    res.json({ ok: true });
+    await resolveAudioUrl(id);
 
-  } catch (e) {
-    console.error("stream:", e.message);
+    const password = encodeURIComponent(
+      String(req.query.password || "")
+    );
 
-    res.status(502).json({
-      error: "falha ao preparar áudio",
-      detail: e.message
+    const url =
+      `${req.protocol}://${req.get("host")}/audio/${id}?password=${password}`;
+
+    return res.json({
+      ok: true,
+      url
+    });
+
+  } catch (error) {
+    console.error("stream:", error.message);
+
+    return res.status(502).json({
+      error: "YouTube não disponibilizou o áudio",
+      detail: error.message
     });
   }
 });
 
-// ---------- reproduzir áudio ----------
+// Transmite o áudio original e permite avançar na música.
 app.get("/audio/:id", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
 
   try {
-    const f = await ensureMp3(id);
+    const mediaUrl = await resolveAudioUrl(id);
 
-    res.type("audio/mpeg");
-    res.setHeader("Cache-Control", "private, max-age=3600");
+    const headers = {};
 
-    res.sendFile(f, { acceptRanges: true });
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
 
-  } catch (e) {
-    console.error("audio:", e.message);
+    headers["User-Agent"] =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
+
+    headers.Referer = "https://www.youtube.com/";
+
+    const upstream = await fetch(mediaUrl, {
+      headers,
+      redirect: "follow"
+    });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      const status = upstream.status === 403
+        ? 502
+        : upstream.status;
+
+      return res.status(status).json({
+        error: `O servidor de áudio respondeu ${upstream.status}`
+      });
+    }
+
+    res.status(upstream.status);
+
+    for (const name of [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges"
+    ]) {
+      const value = upstream.headers.get(name);
+
+      if (value) {
+        res.setHeader(name, value);
+      }
+    }
+
+    if (!res.hasHeader("content-type")) {
+      res.setHeader("content-type", "audio/webm");
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+
+    if (!upstream.body) {
+      return res.end();
+    }
+
+    const body = Readable.fromWeb(upstream.body);
+
+    // Encerra a transmissão se o cliente desconectar.
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        body.destroy();
+      }
+    });
+
+    body.on("error", error => {
+      console.error("proxy de áudio:", error.message);
+
+      if (!res.headersSent) {
+        res.status(502);
+      }
+
+      res.end();
+    });
+
+    body.pipe(res);
+
+  } catch (error) {
+    console.error("audio:", error.message);
 
     if (!res.headersSent) {
       res.status(502).json({
-        error: "falha ao carregar áudio",
-        detail: e.message
+        error: "falha ao transmitir áudio",
+        detail: error.message
       });
+    } else {
+      res.end();
     }
   }
 });
 
-// ---------- download ----------
+// Download mantém o formato original, sem converter para MP3.
 app.get("/download", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
 
   try {
-    const f = await ensureMp3(id);
+    const mediaUrl = await resolveAudioUrl(id);
 
-    res.download(
-      f,
-      `${safeName(req.query.title || id)}.mp3`
+    const headers = {
+      "User-Agent": "Mozilla/5.0",
+      Referer: "https://www.youtube.com/"
+    };
+
+    const upstream = await fetch(mediaUrl, { headers });
+
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({
+        error: `Falha no download: HTTP ${upstream.status}`
+      });
+    }
+
+    const type = upstream.headers.get("content-type") || "";
+    const ext = type.includes("mp4") ? "m4a" : "webm";
+
+    const title = String(req.query.title || id)
+      .replace(/[\\/:*?"<>|]/g, "")
+      .slice(0, 100) || id;
+
+    res.setHeader(
+      "Content-Type",
+      type || "application/octet-stream"
     );
 
-  } catch (e) {
-    console.error("download:", e.message);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${title}.${ext}"`
+    );
+
+    Readable.fromWeb(upstream.body).pipe(res);
+
+  } catch (error) {
+    console.error("download:", error.message);
 
     if (!res.headersSent) {
       res.status(502).json({
         error: "falha no download",
-        detail: e.message
+        detail: error.message
       });
     }
   }
 });
 
-// ---------- iniciar servidor ----------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `waves backend na porta ${PORT} (senha: ${APP_PASSWORD ? "sim" : "não"}, cookies: ${resolvedCookiesFile ? "sim" : "não"})`
+    `musicPJ na porta ${PORT} (senha: ${APP_PASSWORD ? "sim" : "não"}, cookies: ${cookiesFile ? "sim" : "não"}, conversão: não)`
   );
 });
