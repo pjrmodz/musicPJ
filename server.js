@@ -17,10 +17,7 @@ const NETLIFY_ORIGIN =
 
 const configuredOrigins = (
   process.env.ALLOWED_ORIGIN || ""
-)
-  .split(",")
-  .map(origin => origin.trim())
-  .filter(Boolean);
+).split(",").map(origin => origin.trim()).filter(Boolean);
 
 const allowedOrigins = new Set([
   NETLIFY_ORIGIN,
@@ -37,6 +34,61 @@ const YTDLP_EXTRA = (
 
 const ID_RE = /^[\w-]{11}$/;
 
+// Biblioteca persistente
+const DATA_DIR = process.env.DATA_DIR || "/var/data";
+const LIBRARY_FILE =
+  process.env.MUSIC_LIBRARY_FILE ||
+  path.join(DATA_DIR, "musicpj-library.json");
+
+let library = [];
+let libraryReady = false;
+
+function loadLibrary() {
+  try {
+    fs.mkdirSync(path.dirname(LIBRARY_FILE), {
+      recursive: true
+    });
+
+    if (fs.existsSync(LIBRARY_FILE)) {
+      const data = JSON.parse(
+        fs.readFileSync(LIBRARY_FILE, "utf8")
+      );
+
+      library = Array.isArray(data) ? data : [];
+    }
+
+    libraryReady = true;
+    console.log("Biblioteca carregada:", library.length, "músicas");
+  } catch (error) {
+    console.error("Erro ao carregar biblioteca:", error.message);
+    library = [];
+    libraryReady = true;
+  }
+}
+
+function saveLibrary() {
+  try {
+    fs.mkdirSync(path.dirname(LIBRARY_FILE), {
+      recursive: true
+    });
+
+    const temporaryFile = LIBRARY_FILE + ".tmp";
+
+    fs.writeFileSync(
+      temporaryFile,
+      JSON.stringify(library, null, 2),
+      "utf8"
+    );
+
+    fs.renameSync(temporaryFile, LIBRARY_FILE);
+  } catch (error) {
+    console.error("Erro ao salvar biblioteca:", error.message);
+  }
+}
+
+loadLibrary();
+
+// Cookies
 let cookiesFile = process.env.COOKIES_FILE || "";
 
 if (process.env.COOKIES_B64) {
@@ -74,11 +126,7 @@ const corsOptions = {
     return callback(null, false);
   },
   methods: ["GET", "HEAD", "POST", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "Range"
-  ],
+  allowedHeaders: ["Content-Type", "Authorization", "Range"],
   exposedHeaders: [
     "Content-Length",
     "Accept-Ranges",
@@ -91,15 +139,12 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// Autenticação segura
+// Autenticação
 function safeEq(a, b) {
   const A = Buffer.from(String(a));
   const B = Buffer.from(String(b));
 
-  return (
-    A.length === B.length &&
-    timingSafeEqual(A, B)
-  );
+  return A.length === B.length && timingSafeEqual(A, B);
 }
 
 app.use((req, res, next) => {
@@ -121,6 +166,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     name: "musicPJ",
+    library: true,
     conversion: false
   });
 });
@@ -131,9 +177,107 @@ app.get("/health", (req, res) => {
     ok: true,
     auth: !!APP_PASSWORD,
     cookies: !!cookiesFile && fs.existsSync(cookiesFile),
+    library: libraryReady,
+    libraryCount: library.length,
+    libraryFile: LIBRARY_FILE,
     conversion: false
   });
 });
+
+// Biblioteca de músicas
+app.get("/library", (req, res) => {
+  res.json({
+    ok: true,
+    count: library.length,
+    results: library
+  });
+});
+
+// Busca uma música na biblioteca
+app.get("/library/:id", (req, res) => {
+  const id = String(req.params.id || "");
+
+  if (!ID_RE.test(id)) {
+    return res.status(400).json({
+      error: "ID inválido"
+    });
+  }
+
+  const music = library.find(item => item.id === id);
+
+  if (!music) {
+    return res.status(404).json({
+      error: "Música não encontrada na biblioteca"
+    });
+  }
+
+  res.json({ ok: true, music });
+});
+
+// Remove uma música da biblioteca
+app.delete("/library/:id", (req, res) => {
+  const id = String(req.params.id || "");
+
+  if (!ID_RE.test(id)) {
+    return res.status(400).json({
+      error: "ID inválido"
+    });
+  }
+
+  const before = library.length;
+  library = library.filter(item => item.id !== id);
+
+  if (library.length === before) {
+    return res.status(404).json({
+      error: "Música não encontrada"
+    });
+  }
+
+  saveLibrary();
+
+  res.json({
+    ok: true,
+    count: library.length
+  });
+});
+
+// Salva ou atualiza uma música na biblioteca
+function rememberMusic(id, details = {}) {
+  const existing = library.find(item => item.id === id);
+
+  const title = String(details.title || "").slice(0, 200);
+  const artist = String(details.artist || "").slice(0, 200);
+
+  if (existing) {
+    if (title && (!existing.title || existing.title === id)) {
+      existing.title = title;
+    }
+
+    if (artist) {
+      existing.artist = artist;
+    }
+
+    existing.lastPlayed = new Date().toISOString();
+    existing.playCount = (existing.playCount || 0) + 1;
+  } else {
+    library.unshift({
+      id,
+      title: title || id,
+      artist,
+      thumbnail: `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
+      firstPlayed: new Date().toISOString(),
+      lastPlayed: new Date().toISOString(),
+      playCount: 1
+    });
+  }
+
+  // Limita o histórico para não crescer indefinidamente.
+  if (library.length > 1000) {
+    library = library.slice(0, 1000);
+  }
+
+  saveLibrary();
+}
 
 // Argumentos do yt-dlp
 function baseArgs() {
@@ -198,7 +342,7 @@ function runYtdlp(args, timeoutMs = 60000) {
   });
 }
 
-// Validação do ID do YouTube
+// Validação do ID
 function validId(req, res) {
   const id = String(
     req.params.id || req.query.id || ""
@@ -215,7 +359,7 @@ function validId(req, res) {
   return id;
 }
 
-// Formatação da duração
+// Duração
 function formatDuration(value) {
   const seconds = Math.round(Number(value) || 0);
 
@@ -232,7 +376,7 @@ function formatDuration(value) {
   return `${minutes}:${String(remaining).padStart(2, "0")}`;
 }
 
-// Busca de músicas
+// Cache da pesquisa
 const searchCache = new Map();
 
 app.get("/search", async (req, res) => {
@@ -249,10 +393,7 @@ app.get("/search", async (req, res) => {
   const key = q.toLowerCase();
   const cached = searchCache.get(key);
 
-  if (
-    cached &&
-    Date.now() - cached.time < 600000
-  ) {
+  if (cached && Date.now() - cached.time < 600000) {
     return res.json({
       results: cached.results
     });
@@ -287,36 +428,37 @@ app.get("/search", async (req, res) => {
       results
     });
 
-    return res.json({ results });
+    res.json({ results });
 
   } catch (error) {
     console.error("ERRO NA BUSCA:", error.message);
 
-    return res.status(502).json({
+    res.status(502).json({
       error: "Falha na busca do YouTube",
       detail: error.message
     });
   }
 });
 
-// Obtém e diagnostica os formatos disponíveis.
-// Não baixa nem converte para MP3.
+// Cache temporário de endereços de mídia.
+// Os endereços podem expirar; por isso não são salvos
+// como se fossem permanentes.
+const mediaUrlCache = new Map();
+const MEDIA_CACHE_TTL = 5 * 60 * 1000;
+
 async function resolveAudioUrl(id) {
+  const cached = mediaUrlCache.get(id);
+
+  if (cached && Date.now() - cached.time < MEDIA_CACHE_TTL) {
+    console.log("Usando endereço em cache:", id);
+    return cached.url;
+  }
+
   const videoUrl =
     `https://www.youtube.com/watch?v=${id}`;
 
   console.log("Consultando formatos do vídeo:", id);
 
-  const formats = await runYtdlp([
-    "--no-playlist",
-    "--list-formats",
-    videoUrl
-  ], 90000);
-
-  console.log("FORMATOS DISPONÍVEIS NO YOUTUBE:");
-  console.log(formats);
-
-  // Tenta primeiro o melhor formato de áudio.
   const output = await runYtdlp([
     "--no-playlist",
     "--format",
@@ -331,9 +473,21 @@ async function resolveAudioUrl(id) {
 
   if (!url) {
     throw new Error(
-      "Nenhum endereço de áudio foi encontrado."
+      "Nenhum endereço de mídia foi encontrado."
     );
   }
+
+  mediaUrlCache.set(id, {
+    url,
+    time: Date.now()
+  });
+
+  if (mediaUrlCache.size > 300) {
+    const oldest = mediaUrlCache.keys().next().value;
+    mediaUrlCache.delete(oldest);
+  }
+
+  console.log("Endereço de mídia encontrado:", id);
 
   return url;
 }
@@ -348,6 +502,15 @@ app.get("/stream", async (req, res) => {
 
     await resolveAudioUrl(id);
 
+    const searchResult = [...searchCache.values()]
+      .flatMap(item => item.results)
+      .find(item => item.id === id);
+
+    rememberMusic(id, {
+      title: req.query.title || searchResult?.title || id,
+      artist: req.query.artist || searchResult?.artist || ""
+    });
+
     const password = encodeURIComponent(
       String(req.query.password || "")
     );
@@ -355,7 +518,7 @@ app.get("/stream", async (req, res) => {
     const url =
       `${req.protocol}://${req.get("host")}/audio/${id}?password=${password}`;
 
-    return res.json({
+    res.json({
       ok: true,
       url
     });
@@ -363,14 +526,14 @@ app.get("/stream", async (req, res) => {
   } catch (error) {
     console.error("ERRO STREAM:", error.message);
 
-    return res.status(502).json({
+    res.status(502).json({
       error: "Não foi possível obter o áudio do YouTube.",
       detail: error.message
     });
   }
 });
 
-// Transmissão do áudio original
+// Transmissão do áudio
 app.get("/audio/:id", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
@@ -378,7 +541,7 @@ app.get("/audio/:id", async (req, res) => {
   try {
     console.log("Iniciando transmissão:", id);
 
-    const mediaUrl = await resolveAudioUrl(id);
+    let mediaUrl = await resolveAudioUrl(id);
 
     const headers = {
       "User-Agent":
@@ -390,16 +553,24 @@ app.get("/audio/:id", async (req, res) => {
       headers.Range = req.headers.range;
     }
 
-    const upstream = await fetch(mediaUrl, {
+    let upstream = await fetch(mediaUrl, {
       headers,
       redirect: "follow"
     });
 
+    // Se o endereço em cache expirou, tenta renovar uma vez.
+    if (upstream.status === 403 || upstream.status === 410) {
+      mediaUrlCache.delete(id);
+      mediaUrl = await resolveAudioUrl(id);
+
+      upstream = await fetch(mediaUrl, {
+        headers,
+        redirect: "follow"
+      });
+    }
+
     if (!upstream.ok && upstream.status !== 206) {
-      console.error(
-        "Erro no servidor de áudio:",
-        upstream.status
-      );
+      console.error("Erro no servidor de áudio:", upstream.status);
 
       return res.status(502).json({
         error: `Servidor de áudio respondeu ${upstream.status}`
@@ -547,6 +718,8 @@ app.listen(PORT, "0.0.0.0", () => {
       cookiesFile && fs.existsSync(cookiesFile) ? "sim" : "não"
     }`
   );
+  console.log("Biblioteca persistente:", LIBRARY_FILE);
+  console.log("Cache temporário de mídia ativado.");
   console.log("Conversão para MP3: desativada");
   console.log("CORS configurado para o Netlify.");
 });
