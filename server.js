@@ -5,13 +5,13 @@ import { timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 
 const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";      // URL do Netlify em produção
-const APP_PASSWORD = process.env.APP_PASSWORD || "";           // vazio = sem senha
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const APP_PASSWORD = process.env.APP_PASSWORD || "";
 const YTDLP = process.env.YTDLP_PATH || "yt-dlp";
 const YTDLP_EXTRA = (process.env.YTDLP_EXTRA_ARGS ?? "--js-runtimes node").split(" ").filter(Boolean);
-const COOKIES_FILE = process.env.COOKIES_FILE || "";           // opcional (cookies.txt do YouTube)
 const CACHE_DIR = process.env.CACHE_DIR || "/tmp/waves-cache";
 const CACHE_MAX_BYTES = Number(process.env.CACHE_MAX_MB || 400) * 1024 * 1024;
 const CACHE_MAX_AGE_MS = Number(process.env.CACHE_MAX_AGE_MIN || 180) * 60_000;
@@ -21,20 +21,49 @@ const ID_RE = /^[\w-]{11}$/;
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+// ---------- cookies ----------
+// prioridade: COOKIES_B64 > COOKIES_FILE
+let resolvedCookiesFile = process.env.COOKIES_FILE || "";
+
+if (process.env.COOKIES_B64) {
+  try {
+    const decoded = Buffer.from(process.env.COOKIES_B64, "base64").toString("utf8");
+    const tmpPath = path.join(os.tmpdir(), "waves-cookies.txt");
+    fs.writeFileSync(tmpPath, decoded, { mode: 0o600 });
+    resolvedCookiesFile = tmpPath;
+    console.log("cookies carregados via COOKIES_B64 →", tmpPath);
+  } catch (e) {
+    console.error("falha ao decodificar COOKIES_B64:", e.message);
+  }
+}
+
 const app = express();
 app.set("trust proxy", 1);
-app.use(cors({ origin: ALLOWED_ORIGIN, exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges", "Content-Range"] }));
+app.use(cors({
+  origin: ALLOWED_ORIGIN,
+  exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges", "Content-Range"]
+}));
 
 // ---------- util ----------
 const fmtDur = (s) => {
   s = Math.round(Number(s) || 0);
   if (!s) return "";
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
-  return h ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}` : `${m}:${String(r).padStart(2, "0")}`;
+  return h
+    ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`
+    : `${m}:${String(r).padStart(2, "0")}`;
 };
+
 const safeName = (s = "audio") =>
   String(s).replace(/[\\/:*?"<>|\x00-\x1f]/g, "").trim().slice(0, 120) || "audio";
-const baseArgs = () => [...YTDLP_EXTRA, ...(COOKIES_FILE && fs.existsSync(COOKIES_FILE) ? ["--cookies", COOKIES_FILE] : []), "--no-warnings"];
+
+const baseArgs = () => [
+  ...YTDLP_EXTRA,
+  ...(resolvedCookiesFile && fs.existsSync(resolvedCookiesFile)
+    ? ["--cookies", resolvedCookiesFile]
+    : []),
+  "--no-warnings",
+];
 
 function runYtdlp(args, timeoutMs = 60_000) {
   return new Promise((resolve, reject) => {
@@ -46,12 +75,14 @@ function runYtdlp(args, timeoutMs = 60_000) {
     p.on("error", (e) => { clearTimeout(t); reject(e); });
     p.on("close", (code) => {
       clearTimeout(t);
-      code === 0 ? resolve(out) : reject(new Error(err.trim().split("\n").pop() || `yt-dlp saiu com ${code}`));
+      code === 0
+        ? resolve(out)
+        : reject(new Error(err.trim().split("\n").pop() || `yt-dlp saiu com ${code}`));
     });
   });
 }
 
-// ---------- rate limit (por IP) ----------
+// ---------- rate limit ----------
 const hits = new Map();
 setInterval(() => hits.clear(), 60_000).unref();
 app.use((req, res, next) => {
@@ -62,9 +93,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- saúde (sem senha) ----------
+// ---------- saúde ----------
 app.get("/", (_req, res) => res.json({ ok: true, name: "waves-backend" }));
-app.get("/health", (_req, res) => res.json({ ok: true, auth: !!APP_PASSWORD }));
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  auth: !!APP_PASSWORD,
+  cookies: !!resolvedCookiesFile && fs.existsSync(resolvedCookiesFile),
+}));
 
 // ---------- senha ----------
 function safeEq(a, b) {
@@ -78,7 +113,7 @@ app.use((req, res, next) => {
 });
 
 // ---------- busca ----------
-const searchCache = new Map(); // q -> {t, results}
+const searchCache = new Map();
 app.get("/search", async (req, res) => {
   const q = String(req.query.q || "").trim().slice(0, 200);
   if (!q) return res.status(400).json({ error: "q obrigatório" });
@@ -106,11 +141,12 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// ---------- download p/ cache (fila com limite de paralelismo) ----------
-const inflight = new Map(); // id -> Promise<path>
+// ---------- fila de download ----------
+const inflight = new Map();
 let running = 0;
 const waiting = [];
-const acquire = () => new Promise((ok) => (running < MAX_PARALLEL ? (running++, ok()) : waiting.push(ok)));
+const acquire = () =>
+  new Promise((ok) => (running < MAX_PARALLEL ? (running++, ok()) : waiting.push(ok)));
 const release = () => { const next = waiting.shift(); next ? next() : running--; };
 
 const fileFor = (id) => path.join(CACHE_DIR, `${id}.mp3`);
@@ -126,8 +162,11 @@ function ensureMp3(id) {
     await acquire();
     try {
       await runYtdlp([
-        "-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "5",
-        "--no-playlist", "--no-part", "-o", path.join(CACHE_DIR, "%(id)s.%(ext)s"),
+        "-f", "bestaudio", "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "5",
+        "--no-playlist", "--no-part",
+        "-o", path.join(CACHE_DIR, "%(id)s.%(ext)s"),
         `https://www.youtube.com/watch?v=${id}`,
       ], DL_TIMEOUT_MS);
       if (!fs.existsSync(f)) throw new Error("arquivo não gerado");
@@ -138,7 +177,7 @@ function ensureMp3(id) {
   return p;
 }
 
-// ---------- limpeza do cache ----------
+// ---------- limpeza de cache ----------
 async function cleanCache() {
   try {
     const names = (await fsp.readdir(CACHE_DIR)).filter((n) => n.endsWith(".mp3"));
@@ -167,14 +206,17 @@ const validId = (req, res) => {
   return id;
 };
 
-// ---------- /stream: prepara o áudio; o front usa /audio/:id ----------
+// ---------- /stream ----------
 app.get("/stream", async (req, res) => {
   const id = validId(req, res); if (!id) return;
   try { await ensureMp3(id); res.json({ ok: true }); }
-  catch (e) { console.error("stream:", e.message); res.status(502).json({ error: "falha ao preparar áudio", detail: e.message }); }
+  catch (e) {
+    console.error("stream:", e.message);
+    res.status(502).json({ error: "falha ao preparar áudio", detail: e.message });
+  }
 });
 
-// ---------- /audio/:id: arquivo com suporte a Range (seek funciona) ----------
+// ---------- /audio/:id ----------
 app.get("/audio/:id", async (req, res) => {
   const id = validId(req, res); if (!id) return;
   try {
@@ -200,4 +242,6 @@ app.get("/download", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`waves backend na porta ${PORT} (senha: ${APP_PASSWORD ? "sim" : "não"})`));
+app.listen(PORT, () =>
+  console.log(`waves backend na porta ${PORT} (senha: ${APP_PASSWORD ? "sim" : "não"}, cookies: ${resolvedCookiesFile ? "sim" : "não"})`)
+);
