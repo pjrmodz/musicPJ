@@ -1,3 +1,4 @@
+
 import express from "express";
 import cors from "cors";
 import { spawn } from "node:child_process";
@@ -22,7 +23,6 @@ const ID_RE = /^[\w-]{11}$/;
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 // ---------- cookies ----------
-// prioridade: COOKIES_B64 > COOKIES_FILE
 let resolvedCookiesFile = process.env.COOKIES_FILE || "";
 
 if (process.env.COOKIES_B64) {
@@ -37,18 +37,40 @@ if (process.env.COOKIES_B64) {
   }
 }
 
+// ---------- servidor ----------
 const app = express();
 app.set("trust proxy", 1);
+
+// DIAGNÓSTICO: registrar requisições e respostas
+app.use((req, res, next) => {
+  console.log("REQUISIÇÃO RECEBIDA:", req.method, req.path);
+
+  res.on("finish", () => {
+    console.log("RESPOSTA ENVIADA:", req.method, req.path, res.statusCode);
+  });
+
+  next();
+});
+
 app.use(cors({
   origin: ALLOWED_ORIGIN,
-  exposedHeaders: ["Content-Disposition", "Content-Length", "Accept-Ranges", "Content-Range"]
+  exposedHeaders: [
+    "Content-Disposition",
+    "Content-Length",
+    "Accept-Ranges",
+    "Content-Range"
+  ]
 }));
 
-// ---------- util ----------
+// ---------- utilitários ----------
 const fmtDur = (s) => {
   s = Math.round(Number(s) || 0);
   if (!s) return "";
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+
   return h
     ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`
     : `${m}:${String(r).padStart(2, "0")}`;
@@ -62,10 +84,10 @@ const baseArgs = () => [
   ...(resolvedCookiesFile && fs.existsSync(resolvedCookiesFile)
     ? ["--cookies", resolvedCookiesFile]
     : []),
-  "--no-warnings",
+  "--no-warnings"
 ];
 
-
+// ---------- execução yt-dlp ----------
 function runYtdlp(args, timeoutMs = 60_000) {
   return new Promise((resolve, reject) => {
     const p = spawn(YTDLP, [
@@ -112,46 +134,82 @@ function runYtdlp(args, timeoutMs = 60_000) {
     });
   });
 }
-// ---------- rate limit ----------
+
+// ---------- limite de requisições ----------
 const hits = new Map();
+
 setInterval(() => hits.clear(), 60_000).unref();
+
 app.use((req, res, next) => {
   if (req.method === "OPTIONS") return next();
+
   const n = (hits.get(req.ip) || 0) + 1;
   hits.set(req.ip, n);
-  if (n > 240) return res.status(429).json({ error: "muitas requisições" });
+
+  if (n > 240) {
+    return res.status(429).json({ error: "muitas requisições" });
+  }
+
   next();
 });
 
 // ---------- saúde ----------
-app.get("/", (_req, res) => res.json({ ok: true, name: "waves-backend" }));
-app.get("/health", (_req, res) => res.json({
-  ok: true,
-  auth: !!APP_PASSWORD,
-  cookies: !!resolvedCookiesFile && fs.existsSync(resolvedCookiesFile),
-}));
+app.get("/", (_req, res) => {
+  res.json({ ok: true, name: "waves-backend" });
+});
 
-// ---------- senha ----------
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    auth: !!APP_PASSWORD,
+    cookies: !!resolvedCookiesFile && fs.existsSync(resolvedCookiesFile)
+  });
+});
+
+// ---------- autenticação ----------
 function safeEq(a, b) {
-  const A = Buffer.from(String(a)), B = Buffer.from(String(b));
+  const A = Buffer.from(String(a));
+  const B = Buffer.from(String(b));
+
   return A.length === B.length && timingSafeEqual(A, B);
 }
+
 app.use((req, res, next) => {
   if (req.method === "OPTIONS" || !APP_PASSWORD) return next();
-  if (safeEq(req.query.password ?? "", APP_PASSWORD)) return next();
+
+  if (safeEq(req.query.password ?? "", APP_PASSWORD)) {
+    return next();
+  }
+
   res.status(401).json({ error: "senha inválida" });
 });
+
 // ---------- busca ----------
 const searchCache = new Map();
+
 app.get("/search", async (req, res) => {
   const q = String(req.query.q || "").trim().slice(0, 200);
-  if (!q) return res.status(400).json({ error: "q obrigatório" });
+
+  if (!q) {
+    return res.status(400).json({ error: "q obrigatório" });
+  }
+
   const key = q.toLowerCase();
   const hit = searchCache.get(key);
-  if (hit && Date.now() - hit.t < 10 * 60_000) return res.json({ results: hit.results });
+
+  if (hit && Date.now() - hit.t < 10 * 60_000) {
+    return res.json({ results: hit.results });
+  }
+
   try {
-    const out = await runYtdlp(["--flat-playlist", "-J", `ytsearch15:${q}`]);
+    const out = await runYtdlp([
+      "--flat-playlist",
+      "-J",
+      `ytsearch15:${q}`
+    ]);
+
     const data = JSON.parse(out);
+
     const results = (data.entries || [])
       .filter((e) => e && ID_RE.test(e.id))
       .map((e) => ({
@@ -159,118 +217,231 @@ app.get("/search", async (req, res) => {
         title: e.title,
         artist: e.channel || e.uploader || "",
         duration: fmtDur(e.duration),
-        thumbnail: `https://i.ytimg.com/vi/${e.id}/mqdefault.jpg`,
+        thumbnail: `https://i.ytimg.com/vi/${e.id}/mqdefault.jpg`
       }));
-    if (searchCache.size > 200) searchCache.clear();
-    searchCache.set(key, { t: Date.now(), results });
+
+    if (searchCache.size > 200) {
+      searchCache.clear();
+    }
+
+    searchCache.set(key, {
+      t: Date.now(),
+      results
+    });
+
     res.json({ results });
+
   } catch (e) {
     console.error("search:", e.message);
-    res.status(502).json({ error: "falha na busca", detail: e.message });
+
+    res.status(502).json({
+      error: "falha na busca",
+      detail: e.message
+    });
   }
 });
 
-// ---------- fila de download ----------
+// ---------- fila de downloads ----------
 const inflight = new Map();
 let running = 0;
 const waiting = [];
-const acquire = () =>
-  new Promise((ok) => (running < MAX_PARALLEL ? (running++, ok()) : waiting.push(ok)));
-const release = () => { const next = waiting.shift(); next ? next() : running--; };
 
-const fileFor = (id) => path.join(CACHE_DIR, `${id}.mp3`);
+const acquire = () =>
+  new Promise((ok) => {
+    if (running < MAX_PARALLEL) {
+      running++;
+      ok();
+    } else {
+      waiting.push(ok);
+    }
+  });
+
+const release = () => {
+  const next = waiting.shift();
+
+  if (next) {
+    next();
+  } else {
+    running--;
+  }
+};
+
+const fileFor = (id) =>
+  path.join(CACHE_DIR, `${id}.mp3`);
 
 function ensureMp3(id) {
   const f = fileFor(id);
+
   if (fs.existsSync(f) && fs.statSync(f).size > 1024) {
-    const now = new Date(); fs.utimes(f, now, now, () => {});
+    const now = new Date();
+    fs.utimes(f, now, now, () => {});
     return Promise.resolve(f);
   }
-  if (inflight.has(id)) return inflight.get(id);
+
+  if (inflight.has(id)) {
+    return inflight.get(id);
+  }
+
   const p = (async () => {
     await acquire();
+
     try {
       await runYtdlp([
-        "-f", "bestaudio/best", "-x",
+        "-f", "bestaudio/best",
+        "-x",
         "--audio-format", "mp3",
         "--audio-quality", "5",
-        "--no-playlist", "--no-part",
+        "--no-playlist",
+        "--no-part",
         "-o", path.join(CACHE_DIR, "%(id)s.%(ext)s"),
-        `https://www.youtube.com/watch?v=${id}`,
+        `https://www.youtube.com/watch?v=${id}`
       ], DL_TIMEOUT_MS);
-      if (!fs.existsSync(f)) throw new Error("arquivo não gerado");
+
+      if (!fs.existsSync(f)) {
+        throw new Error("arquivo não gerado");
+      }
+
       return f;
-    } finally { release(); }
-  })().finally(() => inflight.delete(id));
+
+    } finally {
+      release();
+    }
+  })().finally(() => {
+    inflight.delete(id);
+  });
+
   inflight.set(id, p);
+
   return p;
 }
 
 // ---------- limpeza de cache ----------
 async function cleanCache() {
   try {
-    const names = (await fsp.readdir(CACHE_DIR)).filter((n) => n.endsWith(".mp3"));
+    const names = (await fsp.readdir(CACHE_DIR))
+      .filter((n) => n.endsWith(".mp3"));
+
     const files = [];
+
     for (const n of names) {
       const p = path.join(CACHE_DIR, n);
       const st = await fsp.stat(p).catch(() => null);
-      if (st) files.push({ p, size: st.size, t: st.mtimeMs });
+
+      if (st) {
+        files.push({
+          p,
+          size: st.size,
+          t: st.mtimeMs
+        });
+      }
     }
+
     const now = Date.now();
     let total = files.reduce((a, f) => a + f.size, 0);
+
     files.sort((a, b) => a.t - b.t);
+
     for (const f of files) {
-      if (now - f.t > CACHE_MAX_AGE_MS || total > CACHE_MAX_BYTES) {
+      if (
+        now - f.t > CACHE_MAX_AGE_MS ||
+        total > CACHE_MAX_BYTES
+      ) {
         await fsp.unlink(f.p).catch(() => {});
         total -= f.size;
       }
     }
-  } catch {}
+
+  } catch (e) {
+    console.error("limpeza de cache:", e.message);
+  }
 }
+
 setInterval(cleanCache, 10 * 60_000).unref();
 
+// ---------- validar ID ----------
 const validId = (req, res) => {
   const id = String(req.params.id ?? req.query.id ?? "");
-  if (!ID_RE.test(id)) { res.status(400).json({ error: "id inválido" }); return null; }
+
+  if (!ID_RE.test(id)) {
+    res.status(400).json({ error: "id inválido" });
+    return null;
+  }
+
   return id;
 };
 
-// ---------- /stream ----------
+// ---------- preparar áudio ----------
 app.get("/stream", async (req, res) => {
-  const id = validId(req, res); if (!id) return;
-  try { await ensureMp3(id); res.json({ ok: true }); }
-  catch (e) {
+  const id = validId(req, res);
+  if (!id) return;
+
+  try {
+    await ensureMp3(id);
+    res.json({ ok: true });
+
+  } catch (e) {
     console.error("stream:", e.message);
-    res.status(502).json({ error: "falha ao preparar áudio", detail: e.message });
+
+    res.status(502).json({
+      error: "falha ao preparar áudio",
+      detail: e.message
+    });
   }
 });
 
-// ---------- /audio/:id ----------
+// ---------- reproduzir áudio ----------
 app.get("/audio/:id", async (req, res) => {
-  const id = validId(req, res); if (!id) return;
+  const id = validId(req, res);
+  if (!id) return;
+
   try {
     const f = await ensureMp3(id);
+
     res.type("audio/mpeg");
     res.setHeader("Cache-Control", "private, max-age=3600");
+
     res.sendFile(f, { acceptRanges: true });
+
   } catch (e) {
     console.error("audio:", e.message);
-    if (!res.headersSent) res.status(502).json({ error: "falha ao carregar áudio", detail: e.message });
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: "falha ao carregar áudio",
+        detail: e.message
+      });
+    }
   }
 });
 
-// ---------- /download ----------
+// ---------- download ----------
 app.get("/download", async (req, res) => {
-  const id = validId(req, res); if (!id) return;
+  const id = validId(req, res);
+  if (!id) return;
+
   try {
     const f = await ensureMp3(id);
-    res.download(f, `${safeName(req.query.title || id)}.mp3`);
+
+    res.download(
+      f,
+      `${safeName(req.query.title || id)}.mp3`
+    );
+
   } catch (e) {
     console.error("download:", e.message);
-    if (!res.headersSent) res.status(502).json({ error: "falha no download", detail: e.message });
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: "falha no download",
+        detail: e.message
+      });
+    }
   }
 });
 
-app.listen(PORT, () =>
-  console.log(`waves backend na porta ${PORT} (senha: ${APP_PASSWORD ? "sim" : "não"}, cookies: ${resolvedCookiesFile ? "sim" : "não"})`)
-);
+// ---------- iniciar servidor ----------
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(
+    `waves backend na porta ${PORT} (senha: ${APP_PASSWORD ? "sim" : "não"}, cookies: ${resolvedCookiesFile ? "sim" : "não"})`
+  );
+});
