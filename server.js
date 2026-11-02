@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const APP_PASSWORD = process.env.APP_PASSWORD || "";
 const YTDLP = process.env.YTDLP_PATH || "yt-dlp";
-const YTDLP_EXTRA = (process.env.YTDLP_EXTRA_ARGS ?? "--js-runtimes node").split(" ").filter(Boolean);
+const YTDLP_EXTRA = (process.env.YTDLP_EXTRA_ARGS ?? "--js-runtimes node --remote-components ejs:github").split(" ").filter(Boolean);
 const CACHE_DIR = process.env.CACHE_DIR || "/tmp/waves-cache";
 const CACHE_MAX_BYTES = Number(process.env.CACHE_MAX_MB || 400) * 1024 * 1024;
 const CACHE_MAX_AGE_MS = Number(process.env.CACHE_MAX_AGE_MIN || 180) * 60_000;
@@ -77,7 +77,7 @@ function runYtdlp(args, timeoutMs = 60_000) {
       clearTimeout(t);
       code === 0
         ? resolve(out)
-        : reject(new Error(err.trim().split("\n").pop() || `yt-dlp saiu com ${code}`));
+        : reject(new Error(err.trim().split("\n").slice(-8).join("\n") || `yt-dlp saiu com ${code}`));
     });
   });
 }
@@ -111,7 +111,6 @@ app.use((req, res, next) => {
   if (safeEq(req.query.password ?? "", APP_PASSWORD)) return next();
   res.status(401).json({ error: "senha inválida" });
 });
-
 // ---------- busca ----------
 const searchCache = new Map();
 app.get("/search", async (req, res) => {
