@@ -9,55 +9,124 @@ import os from "node:os";
 import path from "node:path";
 
 const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const APP_PASSWORD = process.env.APP_PASSWORD || "";
 const YTDLP = process.env.YTDLP_PATH || "yt-dlp";
+
+const NETLIFY_ORIGIN =
+  "https://glistening-souffle-c240b4.netlify.app";
+
+const configuredOrigins = (
+  process.env.ALLOWED_ORIGIN || ""
+)
+  .split(",")
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+const allowedOrigins = new Set([
+  NETLIFY_ORIGIN,
+  "http://localhost:3000",
+  ...configuredOrigins
+]);
+
+const allowAllOrigins = allowedOrigins.has("*");
+
 const YTDLP_EXTRA = (
   process.env.YTDLP_EXTRA_ARGS ??
   "--js-runtimes node --remote-components ejs:github"
-).split(" ").filter(Boolean);
+).split(/\s+/).filter(Boolean);
 
 const ID_RE = /^[\w-]{11}$/;
+
 let cookiesFile = process.env.COOKIES_FILE || "";
 
 if (process.env.COOKIES_B64) {
   try {
     cookiesFile = path.join(os.tmpdir(), "musicpj-cookies.txt");
+
     fs.writeFileSync(
       cookiesFile,
       Buffer.from(process.env.COOKIES_B64, "base64"),
       { mode: 0o600 }
     );
-    console.log("Cookies carregados.");
-  } catch (e) {
-    console.error("Falha ao carregar cookies:", e.message);
+
+    console.log("Cookies carregados via COOKIES_B64.");
+  } catch (error) {
+    console.error("Erro ao carregar cookies:", error.message);
   }
 }
 
 const app = express();
+
 app.set("trust proxy", 1);
 
-app.use(cors({
-  origin: ALLOWED_ORIGIN,
+// CORS: precisa ficar antes das rotas e da autenticação.
+const corsOptions = {
+  origin(origin, callback) {
+    if (
+      !origin ||
+      allowAllOrigins ||
+      allowedOrigins.has(origin)
+    ) {
+      return callback(null, true);
+    }
+
+    console.warn("Origem bloqueada pelo CORS:", origin);
+    return callback(null, false);
+  },
+  methods: ["GET", "HEAD", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Range"
+  ],
   exposedHeaders: [
     "Content-Length",
     "Accept-Ranges",
     "Content-Range",
     "Content-Disposition"
-  ]
-}));
+  ],
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 function safeEq(a, b) {
   const A = Buffer.from(String(a));
   const B = Buffer.from(String(b));
-  return A.length === B.length && timingSafeEqual(A, B);
+
+  return (
+    A.length === B.length &&
+    timingSafeEqual(A, B)
+  );
 }
 
-app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "musicPJ" });
+// Autenticação
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS" || !APP_PASSWORD) {
+    return next();
+  }
+
+  if (safeEq(req.query.password || "", APP_PASSWORD)) {
+    return next();
+  }
+
+  return res.status(401).json({
+    error: "Senha inválida"
+  });
 });
 
-app.get("/health", (_req, res) => {
+// Página inicial
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    name: "musicPJ",
+    conversion: false
+  });
+});
+
+// Verificação do servidor
+app.get("/health", (req, res) => {
   res.json({
     ok: true,
     auth: !!APP_PASSWORD,
@@ -66,16 +135,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.use((req, res, next) => {
-  if (req.method === "OPTIONS" || !APP_PASSWORD) return next();
-
-  if (safeEq(req.query.password ?? "", APP_PASSWORD)) {
-    return next();
-  }
-
-  return res.status(401).json({ error: "senha inválida" });
-});
-
+// Argumentos comuns do yt-dlp
 function baseArgs() {
   return [
     ...YTDLP_EXTRA,
@@ -86,16 +146,20 @@ function baseArgs() {
   ];
 }
 
+// Executa o yt-dlp
 function runYtdlp(args, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
-    const child = spawn(YTDLP, [...baseArgs(), ...args]);
+    const child = spawn(YTDLP, [
+      ...baseArgs(),
+      ...args
+    ]);
 
     let stdout = "";
     let stderr = "";
 
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error("tempo esgotado ao consultar o YouTube"));
+      reject(new Error("Tempo esgotado ao consultar o YouTube."));
     }, timeoutMs);
 
     child.stdout.on("data", chunk => {
@@ -122,7 +186,7 @@ function runYtdlp(args, timeoutMs = 60000) {
         .trim()
         .split("\n")
         .filter(Boolean)
-        .slice(-3)
+        .slice(-4)
         .join(" | ");
 
       reject(new Error(
@@ -132,39 +196,72 @@ function runYtdlp(args, timeoutMs = 60000) {
   });
 }
 
+// Valida ID do YouTube
 function validId(req, res) {
-  const id = String(req.params.id ?? req.query.id ?? "");
+  const id = String(
+    req.params.id || req.query.id || ""
+  );
 
   if (!ID_RE.test(id)) {
-    res.status(400).json({ error: "id inválido" });
+    res.status(400).json({
+      error: "ID do vídeo inválido"
+    });
+
     return null;
   }
 
   return id;
 }
 
-// Busca músicas
+// Formata duração
+function formatDuration(value) {
+  const seconds = Math.round(Number(value) || 0);
+
+  if (!seconds) return "";
+
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remaining = seconds % 60;
+
+  if (hours) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(remaining).padStart(2, "0")}`;
+}
+
+// Busca de músicas
 const searchCache = new Map();
 
 app.get("/search", async (req, res) => {
-  const q = String(req.query.q || "").trim().slice(0, 200);
+  const q = String(req.query.q || "")
+    .trim()
+    .slice(0, 200);
 
   if (!q) {
-    return res.status(400).json({ error: "q obrigatório" });
+    return res.status(400).json({
+      error: "Informe o termo da busca"
+    });
   }
 
   const key = q.toLowerCase();
   const cached = searchCache.get(key);
 
-  if (cached && Date.now() - cached.time < 600000) {
-    return res.json({ results: cached.results });
+  if (
+    cached &&
+    Date.now() - cached.time < 600000
+  ) {
+    return res.json({
+      results: cached.results
+    });
   }
 
   try {
-    const raw = await runYtdlp(
-      ["--flat-playlist", "-J", `ytsearch15:${q}`],
-      90000
-    );
+    const raw = await runYtdlp([
+      "--flat-playlist",
+      "-J",
+      `ytsearch15:${q}`
+    ], 90000);
 
     const data = JSON.parse(raw);
 
@@ -191,31 +288,17 @@ app.get("/search", async (req, res) => {
     return res.json({ results });
 
   } catch (error) {
-    console.error("search:", error.message);
+    console.error("ERRO NA BUSCA:", error.message);
 
     return res.status(502).json({
-      error: "falha na busca",
+      error: "Falha na busca do YouTube",
       detail: error.message
     });
   }
 });
 
-function formatDuration(value) {
-  const seconds = Math.round(Number(value) || 0);
-
-  if (!seconds) return "";
-
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-
-  return h
-    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
-    : `${m}:${String(s).padStart(2, "0")}`;
-}
-
-// Obtém o endereço do áudio original.
-// Não baixa nem converte para MP3.
+// Obtém o endereço original do áudio.
+// Não baixa e não converte para MP3.
 async function resolveAudioUrl(id) {
   const output = await runYtdlp([
     "--no-playlist",
@@ -231,19 +314,21 @@ async function resolveAudioUrl(id) {
 
   if (!url) {
     throw new Error(
-      "YouTube não retornou um endereço de áudio para este vídeo"
+      "O YouTube não retornou um endereço de áudio."
     );
   }
 
   return url;
 }
 
-// O player recebe o endereço do proxy local.
+// Retorna o endereço do áudio para o player.
 app.get("/stream", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
 
   try {
+    console.log("Solicitação de áudio:", id);
+
     await resolveAudioUrl(id);
 
     const password = encodeURIComponent(
@@ -259,33 +344,34 @@ app.get("/stream", async (req, res) => {
     });
 
   } catch (error) {
-    console.error("stream:", error.message);
+    console.error("ERRO STREAM:", error.message);
 
     return res.status(502).json({
-      error: "YouTube não disponibilizou o áudio",
+      error: "Não foi possível obter o áudio do YouTube.",
       detail: error.message
     });
   }
 });
 
-// Transmite o áudio original e permite avançar na música.
+// Transmissão do áudio original
 app.get("/audio/:id", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
 
   try {
+    console.log("Iniciando transmissão:", id);
+
     const mediaUrl = await resolveAudioUrl(id);
 
-    const headers = {};
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+      Referer: "https://www.youtube.com/"
+    };
 
     if (req.headers.range) {
       headers.Range = req.headers.range;
     }
-
-    headers["User-Agent"] =
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
-
-    headers.Referer = "https://www.youtube.com/";
 
     const upstream = await fetch(mediaUrl, {
       headers,
@@ -293,12 +379,13 @@ app.get("/audio/:id", async (req, res) => {
     });
 
     if (!upstream.ok && upstream.status !== 206) {
-      const status = upstream.status === 403
-        ? 502
-        : upstream.status;
+      console.error(
+        "Erro no servidor de áudio:",
+        upstream.status
+      );
 
-      return res.status(status).json({
-        error: `O servidor de áudio respondeu ${upstream.status}`
+      return res.status(502).json({
+        error: `Servidor de áudio respondeu ${upstream.status}`
       });
     }
 
@@ -318,7 +405,7 @@ app.get("/audio/:id", async (req, res) => {
     }
 
     if (!res.hasHeader("content-type")) {
-      res.setHeader("content-type", "audio/webm");
+      res.setHeader("Content-Type", "audio/webm");
     }
 
     res.setHeader("Cache-Control", "no-store");
@@ -329,7 +416,6 @@ app.get("/audio/:id", async (req, res) => {
 
     const body = Readable.fromWeb(upstream.body);
 
-    // Encerra a transmissão se o cliente desconectar.
     res.on("close", () => {
       if (!res.writableEnded) {
         body.destroy();
@@ -337,7 +423,7 @@ app.get("/audio/:id", async (req, res) => {
     });
 
     body.on("error", error => {
-      console.error("proxy de áudio:", error.message);
+      console.error("ERRO NO PROXY:", error.message);
 
       if (!res.headersSent) {
         res.status(502);
@@ -349,20 +435,20 @@ app.get("/audio/:id", async (req, res) => {
     body.pipe(res);
 
   } catch (error) {
-    console.error("audio:", error.message);
+    console.error("ERRO AUDIO:", error.message);
 
     if (!res.headersSent) {
-      res.status(502).json({
-        error: "falha ao transmitir áudio",
+      return res.status(502).json({
+        error: "Falha ao transmitir o áudio.",
         detail: error.message
       });
-    } else {
-      res.end();
     }
+
+    res.end();
   }
 });
 
-// Download mantém o formato original, sem converter para MP3.
+// Download sem conversão para MP3
 app.get("/download", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
@@ -370,12 +456,12 @@ app.get("/download", async (req, res) => {
   try {
     const mediaUrl = await resolveAudioUrl(id);
 
-    const headers = {
-      "User-Agent": "Mozilla/5.0",
-      Referer: "https://www.youtube.com/"
-    };
-
-    const upstream = await fetch(mediaUrl, { headers });
+    const upstream = await fetch(mediaUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Referer: "https://www.youtube.com/"
+      }
+    });
 
     if (!upstream.ok || !upstream.body) {
       return res.status(502).json({
@@ -383,8 +469,12 @@ app.get("/download", async (req, res) => {
       });
     }
 
-    const type = upstream.headers.get("content-type") || "";
-    const ext = type.includes("mp4") ? "m4a" : "webm";
+    const contentType =
+      upstream.headers.get("content-type") || "";
+
+    const extension = contentType.includes("mp4")
+      ? "m4a"
+      : "webm";
 
     const title = String(req.query.title || id)
       .replace(/[\\/:*?"<>|]/g, "")
@@ -392,30 +482,57 @@ app.get("/download", async (req, res) => {
 
     res.setHeader(
       "Content-Type",
-      type || "application/octet-stream"
+      contentType || "application/octet-stream"
     );
 
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${title}.${ext}"`
+      `attachment; filename="${title}.${extension}"`
     );
 
     Readable.fromWeb(upstream.body).pipe(res);
 
   } catch (error) {
-    console.error("download:", error.message);
+    console.error("ERRO DOWNLOAD:", error.message);
 
     if (!res.headersSent) {
-      res.status(502).json({
-        error: "falha no download",
+      return res.status(502).json({
+        error: "Falha no download.",
         detail: error.message
       });
     }
+
+    res.end();
   }
 });
 
+// Erros não tratados
+app.use((error, req, res, next) => {
+  console.error("ERRO NO SERVIDOR:", error);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(500).json({
+    error: "Erro interno do servidor"
+  });
+});
+
+// Inicialização
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `musicPJ na porta ${PORT} (senha: ${APP_PASSWORD ? "sim" : "não"}, cookies: ${cookiesFile ? "sim" : "não"}, conversão: não)`
+    `musicPJ iniciado na porta ${PORT}`
   );
+
+  console.log(
+    `Senha configurada: ${APP_PASSWORD ? "sim" : "não"}`
+  );
+
+  console.log(
+    `Cookies configurados: ${cookiesFile && fs.existsSync(cookiesFile) ? "sim" : "não"}`
+  );
+
+  console.log("Conversão para MP3: desativada");
+  console.log("CORS configurado para o Netlify.");
 });
