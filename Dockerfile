@@ -30,4 +30,4 @@ ENV NODE_ENV=production
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js --host 127.0.0.1 & yt-dlp --version; exec node server.js"]
+CMD ["sh", "-c", "yt-dlp --verbose --js-runtimes node --remote-components ejs:github --plugin-dirs /opt/bgutil/plugin --extractor-args 'youtube:player-client=mweb,tv,web_safari' --list-formats 'https://www.youtube.com/watch?v=cWlBXqplRRY' 2>&1 | grep -E 'PO Token Providers|Generating .*PO Token|bgutil|ERROR:|Available formats'; exec node server.js"]
