@@ -59,7 +59,7 @@ const app = express();
 
 app.set("trust proxy", 1);
 
-// CORS: precisa ficar antes das rotas e da autenticação.
+// CORS
 const corsOptions = {
   origin(origin, callback) {
     if (
@@ -91,6 +91,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
+// Autenticação segura
 function safeEq(a, b) {
   const A = Buffer.from(String(a));
   const B = Buffer.from(String(b));
@@ -101,7 +102,6 @@ function safeEq(a, b) {
   );
 }
 
-// Autenticação
 app.use((req, res, next) => {
   if (req.method === "OPTIONS" || !APP_PASSWORD) {
     return next();
@@ -125,7 +125,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// Verificação do servidor
+// Saúde do servidor
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -135,7 +135,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Argumentos comuns do yt-dlp
+// Argumentos do yt-dlp
 function baseArgs() {
   return [
     ...YTDLP_EXTRA,
@@ -159,7 +159,9 @@ function runYtdlp(args, timeoutMs = 60000) {
 
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error("Tempo esgotado ao consultar o YouTube."));
+      reject(new Error(
+        "Tempo esgotado ao consultar o YouTube."
+      ));
     }, timeoutMs);
 
     child.stdout.on("data", chunk => {
@@ -186,7 +188,7 @@ function runYtdlp(args, timeoutMs = 60000) {
         .trim()
         .split("\n")
         .filter(Boolean)
-        .slice(-4)
+        .slice(-5)
         .join(" | ");
 
       reject(new Error(
@@ -196,7 +198,7 @@ function runYtdlp(args, timeoutMs = 60000) {
   });
 }
 
-// Valida ID do YouTube
+// Validação do ID do YouTube
 function validId(req, res) {
   const id = String(
     req.params.id || req.query.id || ""
@@ -213,7 +215,7 @@ function validId(req, res) {
   return id;
 }
 
-// Formata duração
+// Formatação da duração
 function formatDuration(value) {
   const seconds = Math.round(Number(value) || 0);
 
@@ -260,7 +262,7 @@ app.get("/search", async (req, res) => {
     const raw = await runYtdlp([
       "--flat-playlist",
       "-J",
-      `ytsearch15:${q}`
+      "ytsearch15:" + q
     ], 90000);
 
     const data = JSON.parse(raw);
@@ -297,15 +299,30 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// Obtém o endereço original do áudio.
-// Não baixa e não converte para MP3.
+// Obtém e diagnostica os formatos disponíveis.
+// Não baixa nem converte para MP3.
 async function resolveAudioUrl(id) {
+  const videoUrl =
+    `https://www.youtube.com/watch?v=${id}`;
+
+  console.log("Consultando formatos do vídeo:", id);
+
+  const formats = await runYtdlp([
+    "--no-playlist",
+    "--list-formats",
+    videoUrl
+  ], 90000);
+
+  console.log("FORMATOS DISPONÍVEIS NO YOUTUBE:");
+  console.log(formats);
+
+  // Tenta primeiro o melhor formato de áudio.
   const output = await runYtdlp([
     "--no-playlist",
     "--format",
-    "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+    "bestaudio/best",
     "--get-url",
-    `https://www.youtube.com/watch?v=${id}`
+    videoUrl
   ], 90000);
 
   const url = output
@@ -314,14 +331,14 @@ async function resolveAudioUrl(id) {
 
   if (!url) {
     throw new Error(
-      "O YouTube não retornou um endereço de áudio."
+      "Nenhum endereço de áudio foi encontrado."
     );
   }
 
   return url;
 }
 
-// Retorna o endereço do áudio para o player.
+// Rota de reprodução
 app.get("/stream", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
@@ -448,7 +465,7 @@ app.get("/audio/:id", async (req, res) => {
   }
 });
 
-// Download sem conversão para MP3
+// Download no formato original, sem conversão.
 app.get("/download", async (req, res) => {
   const id = validId(req, res);
   if (!id) return;
@@ -506,7 +523,7 @@ app.get("/download", async (req, res) => {
   }
 });
 
-// Erros não tratados
+// Tratamento de erros
 app.use((error, req, res, next) => {
   console.error("ERRO NO SERVIDOR:", error);
 
@@ -521,18 +538,15 @@ app.use((error, req, res, next) => {
 
 // Inicialização
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `musicPJ iniciado na porta ${PORT}`
-  );
-
+  console.log(`musicPJ iniciado na porta ${PORT}`);
   console.log(
     `Senha configurada: ${APP_PASSWORD ? "sim" : "não"}`
   );
-
   console.log(
-    `Cookies configurados: ${cookiesFile && fs.existsSync(cookiesFile) ? "sim" : "não"}`
+    `Cookies configurados: ${
+      cookiesFile && fs.existsSync(cookiesFile) ? "sim" : "não"
+    }`
   );
-
   console.log("Conversão para MP3: desativada");
   console.log("CORS configurado para o Netlify.");
 });
