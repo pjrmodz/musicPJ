@@ -65,23 +65,53 @@ const baseArgs = () => [
   "--no-warnings",
 ];
 
+
 function runYtdlp(args, timeoutMs = 60_000) {
   return new Promise((resolve, reject) => {
-    const p = spawn(YTDLP, [...baseArgs(), ...args]);
-    let out = "", err = "";
-    const t = setTimeout(() => { p.kill("SIGKILL"); reject(new Error("timeout")); }, timeoutMs);
-    p.stdout.on("data", (d) => (out += d));
-    p.stderr.on("data", (d) => (err += d));
-    p.on("error", (e) => { clearTimeout(t); reject(e); });
+    const p = spawn(YTDLP, [
+      ...baseArgs(),
+      "--verbose",
+      ...args
+    ]);
+
+    let out = "";
+    let err = "";
+
+    const t = setTimeout(() => {
+      p.kill("SIGKILL");
+      reject(new Error("timeout"));
+    }, timeoutMs);
+
+    p.stdout.on("data", (d) => {
+      out += d.toString();
+    });
+
+    p.stderr.on("data", (d) => {
+      err += d.toString();
+    });
+
+    p.on("error", (e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+
     p.on("close", (code) => {
       clearTimeout(t);
-      code === 0
-        ? resolve(out)
-        : reject(new Error(err.trim().split("\n").slice(-8).join("\n") || `yt-dlp saiu com ${code}`));
+
+      if (code === 0) {
+        resolve(out);
+      } else {
+        const detalhes = err.trim().split("\n").slice(-25).join("\n");
+
+        console.error("yt-dlp diagnóstico:\n" + detalhes);
+
+        reject(new Error(
+          detalhes || `yt-dlp saiu com código ${code}`
+        ));
+      }
     });
   });
 }
-
 // ---------- rate limit ----------
 const hits = new Map();
 setInterval(() => hits.clear(), 60_000).unref();
