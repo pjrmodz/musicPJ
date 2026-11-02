@@ -2,7 +2,7 @@ services:
   - type: web
     name: waves-backend
     runtime: docker
-    rootDir: backend
+    rootDir: .
     plan: free
     healthCheckPath: /health
     envVars:
